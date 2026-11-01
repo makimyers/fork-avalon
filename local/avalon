@@ -77,6 +77,11 @@ free_gpu() {   # the other local models share port 8080 and the VRAM
     port_busy && die "port $PORT is still busy: stop that server by hand"
   fi
   local lms="$HOME/.lmstudio/bin/lms"; [ -x "$lms" ] && "$lms" unload --all >/dev/null 2>&1 || true
+  # ComfyUI keeps its models in VRAM and RAM between jobs (fork-strata's launcher closes it too, RAM_HOGS)
+  if pkill -u "$USER" -f 'ComfyUI/main.py'; then
+    for _ in $(seq 1 15); do pgrep -u "$USER" -f 'ComfyUI/main.py' >/dev/null || break; sleep 1; done
+    say "closed ComfyUI to free its VRAM and RAM"
+  fi
   # The expert cache is sized from the VRAM free at load; CoolerControl's window held 1.75 GiB (fork-strata, 2026-10-25).
   # Its fan service (coolercontrold) is a separate root process and keeps running.
   pkill -x coolercontrol && say "closed the CoolerControl window to free its VRAM" || true
