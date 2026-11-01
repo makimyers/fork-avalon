@@ -2,6 +2,9 @@
 
 # Avalon
 
+> **This fork (makimyers/fork-avalon):** the setup for this PC, with the dsh launcher, the taskbar entry and measured
+> speeds, is in [local/README.md](local/README.md).
+
 **91 tokens/s on an AMD RX 7900 XT (PCIe 3.0, Ryzen 7 3800XT, 64 GB DDR4) for Qwen3.8-Flash-Next (125B MoE).**
 
 **32 GB of RAM is enough:** the 89 GiB model is bigger than RAM and VRAM combined, and still runs at 89 tokens/s.
