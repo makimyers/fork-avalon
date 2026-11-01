@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+# avalon — Qwen3.8-Flash-Next on Avalon's llama-server (GPU expert cache + MTP), driven by the DeepSeek Harness (dsh).
+#
+# The server command is the README's Run section (install.sh's avalon-server) plus an alias for dsh's `avalon` route
+# (tool-deepseek-setup/dsh/providers.txt). The agent is the dsh-ultimate-setup install in ~/.dsh.
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+avalon — Qwen3.8-Flash-Next on Avalon + DeepSeek Harness
+
+  avalon              close the other local model servers, start the model, open dsh web on it;
+                      closing dsh (or Ctrl+C) unloads the model
+  avalon up | down    start / stop the model server only (127.0.0.1:8080)
+  avalon status       is it up, VRAM in use
+  avalon logs         follow the server log
+  avalon print-cmd    the llama-server command line, without running it
+
+Environment: AVALON_CTX (262144), AVALON_MODEL_DIR, AVALON_EFFORT (dsh effort: off|low|medium|max), DSH_HOME (~/.dsh)
+EOF
+}
+
+# llama-server, dsh and the GPU are on the host; from the Claude desktop container, hop out first (as swh does).
+case "${1:-}" in help|-h|--help|print-cmd) ;; *)
+  if [ -f /run/.containerenv ] && command -v distrobox-host-exec >/dev/null; then
+    mapfile -t pass < <(env | grep -E '^(AVALON_[A-Z_]+|GGML_CUDA_MOE_PIN|DSH_HOME)=')   # host-exec does not forward the environment
+    exec distrobox-host-exec env "${pass[@]}" "$(readlink -f "$0")" "$@"
+  fi ;;
+esac
+
+ROOT=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
+SERVER="$ROOT/build/bin/llama-server"
+MODEL_DIR="${AVALON_MODEL_DIR:-$HOME/Avalon-models/Qwen3.8-Flash-Next-Avalon-GGUF}"
+ALIAS="qwen3.8-flash-next-avalon"   # must match the `avalon` route's model id
+CTX="${AVALON_CTX:-262144}"         # and its context window
+PORT=8080
+URL="http://127.0.0.1:$PORT"
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/avalon"
+PIDF="$STATE/server.pid"
+LOG="$STATE/server.log"
+DSH_HOME="${DSH_HOME:-$HOME/.dsh}"
+OVERLAY="$DSH_HOME/avalon.yml"
+# The build links the ROCm libraries of fork-strata's TheRock SDK (local/build.sh).
+SP="${AVALON_ROCM_SITE:-$HOME/Projects/fork-strata/.venv/lib/python3.14/site-packages}"
+export LD_LIBRARY_PATH="$SP/_rocm_sdk_devel/lib:$SP/_rocm_sdk_libraries_gfx110X_dgpu/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+# Experts registered with the GPU driver (GGML_CUDA_MOE_PIN, moe-cache.cu) only when RAM can hold them: registered pages
+# are tracked by MMU notifiers, and with too little free RAM the kernel reclaims them and KFD's restore worker faults
+# them back in nonstop (local/README.md, Measured). Decided in start(), after the other model servers are closed.
+PIN_MIN_FREE_GIB=70
+
+# README, Run: --fit (default) puts the dense weights on the GPU and the experts in RAM, the expert cache takes the rest of
+# the VRAM; --parallel 1 so no other slot holds part of the KV cache; MTP draft head with 2 draft tokens.
+ARGS=(-m Qwen3.8-Flash-Next-Avalon-IQ3KS-00001-of-00033.gguf --alias "$ALIAS"
+  -c "$CTX" -b 9536 -ub 9536 -fa on -ctk q8_0 -ctv q4_0 --jinja --parallel 1
+  -md MTP/mtp-Qwen3.8-Flash-Next-shared-IQ3K-IQ4NL-FR65k.gguf --spec-type draft-mtp
+  --spec-draft-n-max 2 -ubd 256 -ctkd q8_0 -ctvd q8_0
+  --reasoning-format deepseek       # thinking in reasoning_content, as dsh's thinking=qwen routes expect
+  --host 127.0.0.1 --port "$PORT" --metrics --no-webui)
+
+say() { printf 'avalon: %s\n' "$*"; }
+die() { say "$*" >&2; exit 1; }
+port_busy() { [ "$(curl -s -m 3 -o /dev/null -w '%{http_code}' "$URL/health" 2>/dev/null)" != 000 ]; }   # 503 while loading counts
+up_ours() { curl -fs -m 3 "$URL/v1/models" 2>/dev/null | grep -q "\"$ALIAS\""; }
+pid_ours() { local p; p="$(cat "$PIDF" 2>/dev/null)" && [ -n "$p" ] && ps -p "$p" -o comm= 2>/dev/null | grep -q llama-server && echo "$p"; }
+vram() {
+  local d; for d in /sys/class/drm/card*/device; do   # the card with the most VRAM, not an iGPU
+    [ -f "$d/mem_info_vram_used" ] && echo "$(( $(cat "$d/mem_info_vram_total") / 1048576 )) $(( $(cat "$d/mem_info_vram_used") / 1048576 ))"
+  done | sort -n | tail -1 | { read -r t u && echo "$u / $t MiB"; } || true
+}
+
+free_gpu() {   # the other local models share port 8080 and the VRAM
+  if port_busy; then
+    say "stopping the server on port $PORT to free VRAM"
+    fuser -k -TERM "$PORT/tcp" >/dev/null 2>&1 || true
+    for _ in $(seq 1 30); do port_busy || break; sleep 1; done
+    port_busy && { fuser -k -KILL "$PORT/tcp" >/dev/null 2>&1 || true; sleep 2; }
+    port_busy && die "port $PORT is still busy: stop that server by hand"
+  fi
+  local lms="$HOME/.lmstudio/bin/lms"; [ -x "$lms" ] && "$lms" unload --all >/dev/null 2>&1 || true
+  # The expert cache is sized from the VRAM free at load; CoolerControl's window held 1.75 GiB (fork-strata, 2026-10-25).
+  # Its fan service (coolercontrold) is a separate root process and keeps running.
+  pkill -x coolercontrol && say "closed the CoolerControl window to free its VRAM" || true
+}
+
+start() {   # 0 = started now, 2 = was already up
+  if up_ours; then return 2; fi
+  [ -f "$MODEL_DIR/${ARGS[1]}" ] || die "model missing in $MODEL_DIR (local/README.md, Install)"
+  [ -x "$SERVER" ] || die "llama-server missing: $SERVER (run local/build.sh)"
+  free_gpu
+  local avail; avail=$(awk '/^MemAvailable:/ {print int($2 / 1048576)}' /proc/meminfo)
+  if [ -z "${GGML_CUDA_MOE_PIN:-}" ]; then
+    export GGML_CUDA_MOE_PIN=$(( avail >= PIN_MIN_FREE_GIB ))
+    [ "$GGML_CUDA_MOE_PIN" = 1 ] || say "only $avail GiB of RAM free (under $PIN_MIN_FREE_GIB): experts not pinned; close big apps for full speed"
+  fi
+  rm -f "$PIDF"; mkdir -p "$STATE"; [ -f "$LOG" ] && mv "$LOG" "$LOG.1"
+  (cd "$MODEL_DIR" && exec nohup "$SERVER" "${ARGS[@]}" > "$LOG" 2>&1 < /dev/null) &
+  local p=$!; echo "$p" > "$PIDF"
+  printf 'avalon: loading Qwen3.8-Flash-Next (%s context; the first load reads ~89 GiB from disk)' "$CTX"
+  for _ in $(seq 1 900); do
+    if up_ours; then echo; say "ready on $URL/v1 (VRAM $(vram); log $LOG)"; return 0; fi
+    kill -0 "$p" 2>/dev/null || { echo; say "llama-server exited:"; tail -n 25 "$LOG" >&2; rm -f "$PIDF"; exit 1; }
+    printf .; sleep 1
+  done
+  echo; kill "$p" 2>/dev/null; rm -f "$PIDF"; die "no answer after 15 minutes (log: $LOG)"
+}
+
+stop() {
+  local p; p="$(pid_ours)" || { rm -f "$PIDF"; say "not running"; return 0; }
+  kill "$p"; for _ in $(seq 1 30); do kill -0 "$p" 2>/dev/null || break; sleep 1; done
+  kill -0 "$p" 2>/dev/null && kill -9 "$p"
+  rm -f "$PIDF"; say "stopped; VRAM $(vram)"
+}
+
+overlay() {   # dsh's default model for this run only; plain `dsh web` keeps its own default
+  mkdir -p "$DSH_HOME"
+  { echo "# Written by fork-avalon/local/avalon on every start: Avalon as dsh's default model.   dsh web --patch $OVERLAY"
+    echo "- id: agent-default-model"
+    echo "  config:"
+    echo "    provider: avalon"
+    echo "    model: \"$ALIAS\""
+    if [ -n "${AVALON_EFFORT:-}" ]; then echo "    reasoningEffort: '$AVALON_EFFORT'"; fi
+    # No Agent Teams: one slot (--parallel 1) answers one conversation at a time, so teammates would queue and re-read
+    # their context at every switch (the same reason as fork-strata's launcher).
+    for row in tool-agent-team ui-agent-team agent-team; do printf -- '- id: %s\n  disabled: true\n' "$row"; done
+  } > "$OVERLAY"
+}
+
+session() {   # start the model if needed, run dsh, unload the model afterwards if this call loaded it
+  local rc=0 dsh
+  dsh="$(command -v dsh || echo "$HOME/.local/bin/dsh")"; [ -x "$dsh" ] || die "dsh not found (tool-deepseek-setup/install.sh)"
+  grep -qs '^AVALON_API_KEY=' "$DSH_HOME/.env" || die "add AVALON_API_KEY=local to $DSH_HOME/.env, then re-run tool-deepseek-setup/install.sh"
+  # dsh web takes port 3080: end another one first. The Strata launcher and swh unload their model when theirs ends
+  # (Strata: engine stop, swh: trap), which frees port 8080 the clean way.
+  if pkill -u "$USER" -f '(^|/)dsh web( |$)'; then   # `node .../dsh web ...` or a bare `dsh web`
+    say "closed another dsh web session (its launcher unloads its model)"
+    for _ in $(seq 1 60); do port_busy && ! up_ours || break; sleep 1; done
+  fi
+  # Sleep with the model in GPU memory hung the PC (fork-strata, 2026-10-26): block it while this runs. tail --pid ends
+  # the lock with this process, even if it is killed.
+  systemd-inhibit --what=sleep --mode=block --who="Avalon model loaded" --why="Ctrl+C its window first" \
+    tail --pid=$$ -f /dev/null >/dev/null 2>&1 &
+  # Set before the load, so a Ctrl+C or a closed window while it loads unloads it too. The window owns the server even
+  # when `avalon up` started it: the sleep lock ends with the window, so the model must not outlive it.
+  trap 'echo; say "unloading..."; stop; say "you can close this window"' EXIT
+  trap 'exit 130' INT TERM HUP   # HUP: the launcher's terminal window was closed
+  start || [ $? = 2 ]
+  overlay
+  say "opening the DeepSeek Harness web UI (model avalon/$ALIAS); Ctrl+C here unloads the model"
+  DSH_HOME="$DSH_HOME" "$dsh" "$@" || rc=$?
+  return $rc
+}
+
+case "${1:-web}" in
+  web)        shift || true; session web --patch "$OVERLAY" "$@" ;;
+  up)         start || { [ $? = 2 ] && say "already running on $URL/v1"; } ;;
+  down)       stop ;;
+  status)     if up_ours; then say "running on $URL/v1$(p="$(pid_ours)" && echo " (pid $p)"), VRAM $(vram)"; else say "not running, VRAM $(vram)"; exit 1; fi ;;
+  logs)       exec tail -n 50 -F "$LOG" ;;
+  print-cmd)  printf '(cd %q && ' "$MODEL_DIR"; printf '%q ' "$SERVER" "${ARGS[@]}"; echo ')' ;;
+  help|-h|--help) usage ;;
+  *)          usage >&2; exit 2 ;;
+esac

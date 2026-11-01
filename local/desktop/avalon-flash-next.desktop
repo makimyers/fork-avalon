@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Avalon Flash-Next
+GenericName=AI coding agent
+Comment=dsh web on Qwen3.8-Flash-Next via Avalon's llama-server (closes other model servers, loads the model, opens the browser; closing the window unloads it)
+# konsole as fork-strata's brilliance-flash-next.desktop does; --hold keeps errors readable.
+Exec=konsole --title "dsh · Avalon Flash-Next" --hold -e /var/home/maki/Projects/fork-avalon/local/avalon
+Icon=avalon-flash-next
+Terminal=false
+Categories=Development;
+Keywords=dsh;deepseek;harness;avalon;qwen;flash;llama;
+StartupWMClass=konsole
