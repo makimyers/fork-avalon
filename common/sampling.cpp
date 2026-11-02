@@ -1,5 +1,7 @@
 #include "sampling.h"
 
+#include <mutex>
+
 #include "common.h"
 #include "fit.h"
 #include "log.h"
@@ -175,6 +177,12 @@ struct common_sampler {
     // sampling is the argmax of the biased logits, scanned once (buun, 3a6c97465); biases sorted by token, summed
     bool greedy_argmax = false;
     std::vector<llama_logit_bias> greedy_bias;
+
+    // the chain the backend runs (backend sampling), when it differs from chain: greedy alone where greedy_argmax holds
+    // without biases (the chain's top-k of 40 then ran on the GPU before its argmax: a radix top-k of the 248k logits,
+    // ~36 us a row on RDNA3); shared by the requests with the same biases unless owned
+    struct llama_sampler * chain_backend = nullptr;
+    bool chain_backend_owned = false;
 };
 
 std::string common_params_sampling::print() const {
@@ -429,11 +437,7 @@ struct common_sampler * common_sampler_init(
         params.backend_sampling = false;
     }
 
-    if (rbudget && params.backend_sampling) {
-        LOG_WRN("%s: backend sampling is not compatible with reasoning budget, disabling\n", __func__);
-
-        params.backend_sampling = false;
-    }
+    // a reasoning budget keeps backend sampling: common_sampler_sample returns the token it forces itself
 
     auto * result = new common_sampler {
         /* .params  = */ params,
@@ -448,7 +452,7 @@ struct common_sampler * common_sampler_init(
     };
 
     // the other samplers of the chain leave the argmax in place at these settings; a temperature <= 0 keeps it alone
-    if (grmr == nullptr && rbudget == nullptr && params.mirostat == 0 && params.n_probs == 0 &&
+    if (grmr == nullptr && params.mirostat == 0 && params.n_probs == 0 &&
         params.temp <= 0.0f && params.dynatemp_range == 0.0f &&
         params.penalty_repeat == 1.0f && params.penalty_freq == 0.0f && params.penalty_present == 0.0f &&
         params.dry_multiplier == 0.0f && params.xtc_probability == 0.0f && params.typ_p >= 1.0f &&
@@ -496,6 +500,50 @@ struct common_sampler * common_sampler_init(
             }
             bias.resize(n);
         }
+        if (result->greedy_argmax) {
+            // greedy on the backend (after the sparse biases, if any), one chain per set of biases shared by all
+            // requests (greedy keeps no state; the bias sampler's inputs are its biases): a context given the sampler
+            // it already has neither reserves its scheduler again nor rebuilds its graphs (a new chain each request
+            // cost ~0.3 s before its first token: the worst-case reservation, then every small graph rebuilt). Past
+            // 16 sets, a chain of the request's own.
+            static std::mutex mtx;
+            static std::vector<std::pair<std::vector<llama_logit_bias>, llama_sampler *>> shared;
+            const auto & bias = result->greedy_bias;
+            const auto same = [&](const std::vector<llama_logit_bias> & b) {
+                if (b.size() != bias.size()) {
+                    return false;
+                }
+                for (size_t i = 0; i < b.size(); i++) {
+                    if (b[i].token != bias[i].token || b[i].bias != bias[i].bias) {
+                        return false;
+                    }
+                }
+                return true;
+            };
+            const auto make = [&]() {
+                llama_sampler * c = llama_sampler_chain_init(llama_sampler_chain_default_params());
+                if (!bias.empty()) {
+                    llama_sampler_chain_add(c, llama_sampler_init_logit_bias(llama_vocab_n_tokens(vocab), (int32_t) bias.size(), bias.data()));
+                }
+                llama_sampler_chain_add(c, llama_sampler_init_greedy());
+                return c;
+            };
+            std::lock_guard<std::mutex> lock(mtx);
+            for (const auto & e : shared) {
+                if (same(e.first)) {
+                    result->chain_backend = e.second;
+                    break;
+                }
+            }
+            if (!result->chain_backend && shared.size() < 16) {
+                shared.push_back({ bias, make() });
+                result->chain_backend = shared.back().second;
+            }
+            if (!result->chain_backend) {
+                result->chain_backend       = make();
+                result->chain_backend_owned = true;
+            }
+        }
     }
 
     return result;
@@ -509,6 +557,9 @@ void common_sampler_free(struct common_sampler * gsmpl) {
     llama_sampler_free(gsmpl->grmr);
     llama_sampler_free(gsmpl->rbudget);
     llama_sampler_free(gsmpl->chain);
+    if (gsmpl->chain_backend_owned) {
+        llama_sampler_free(gsmpl->chain_backend);
+    }
 
     delete gsmpl;
 }
@@ -583,6 +634,8 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .t_total_us    = */ 0,
         /* .greedy_argmax = */ gsmpl->greedy_argmax,
         /* .greedy_bias   = */ gsmpl->greedy_bias,
+        /* .chain_backend = */ gsmpl->chain_backend_owned ? llama_sampler_clone(gsmpl->chain_backend) : gsmpl->chain_backend,
+        /* .chain_backend_owned = */ gsmpl->chain_backend_owned,
     };
 }
 
@@ -660,11 +713,27 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
     return gsmpl->chain;
 }
 
+struct llama_sampler * common_sampler_get_backend(const struct common_sampler * gsmpl) {
+    if (!gsmpl) {
+        return nullptr;
+    }
+
+    return gsmpl->chain_backend ? gsmpl->chain_backend : gsmpl->chain;
+}
+
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
     llama_synchronize(ctx);
 
     // start measuring sampling time after the llama_context synchronization in order to not measure any ongoing async operations
     const auto tm = gsmpl->tm();
+
+    // the reasoning budget forcing its message and end tag: that token, whatever was sampled
+    if (const llama_token forced = common_reasoning_budget_forced_token(gsmpl->rbudget); forced != LLAMA_TOKEN_NULL) {
+        gsmpl->cur.resize(1);
+        gsmpl->cur[0] = llama_token_data{forced, 0.0f, 1.0f};
+        gsmpl->cur_p  = { gsmpl->cur.data(), 1, 0, true };
+        return forced;
+    }
 
     // greedy: one scan of the (sparsely biased) logits, in index order, instead of a candidate per vocabulary entry
     // run through the chain
@@ -721,7 +790,6 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
             LOG_DBG("%s: Backend sampler selected token: '%d'. Will not run any CPU samplers\n", __func__, id);
 
             GGML_ASSERT(!gsmpl->grmr    && "using grammar in combination with backend sampling is not supported");
-            GGML_ASSERT(!gsmpl->rbudget && "using reasoning budget in combination with backend sampling is not supported");
 
             for (size_t i = 0; i < cur_p.size; ++i) {
                 if (cur_p.data[i].id == id) {

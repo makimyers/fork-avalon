@@ -45,20 +45,22 @@ case "$rocm_ver" in
     *)   fail "ROCm $rocm_ver found; Avalon is tested with ROCm 7.2.4 only" ;;
 esac
 
-# GPU: RDNA3 discrete (gfx1100 measured; gfx1101 / gfx1102 should work); APUs and older generations are refused
+# GPU: RDNA3 (gfx1100 measured; gfx1101 / gfx1102 should work) or RDNA4 (gfx1200 / gfx1201: reported working by a user,
+# a Radeon AI PRO R9700, not measured here); APUs and older generations are refused
 if [ -z "${AMDGPU_TARGETS:-}" ]; then
     gfx=$("$ROCM/bin/rocminfo" 2>/dev/null | grep -oE '\bgfx[0-9a-f]+\b' | sort -u | tr '\n' ' ' || true)
-    for g in gfx1100 gfx1101 gfx1102; do
+    for g in gfx1100 gfx1101 gfx1102 gfx1201 gfx1200; do
         case " $gfx " in *" $g "*) AMDGPU_TARGETS=$g; break ;; esac
     done
     if [ -z "${AMDGPU_TARGETS:-}" ]; then
-        fail "no RDNA3 discrete GPU found (rocminfo reports: ${gfx:-nothing}). Avalon's kernels target gfx1100 / gfx1101 / gfx1102"
+        fail "no RDNA3 / RDNA4 discrete GPU found (rocminfo reports: ${gfx:-nothing}). Avalon's kernels target gfx1100 - gfx1102 and gfx1200 / gfx1201"
         AMDGPU_TARGETS=${gfx%% *}
     fi
 fi
 case "$AMDGPU_TARGETS" in
-    gfx1100) echo "GPU $AMDGPU_TARGETS (RX 7900 XT / XTX: the measured target)" ;;
-    *)       warn "GPU $AMDGPU_TARGETS: should work, not measured (Avalon is tuned on a gfx1100)" ;;
+    gfx1100)         echo "GPU $AMDGPU_TARGETS (RX 7900 XT / XTX: the measured target)" ;;
+    gfx1200|gfx1201) warn "GPU $AMDGPU_TARGETS (RDNA4): reported working by a user (R9700), not measured here; some prompt kernels are RDNA3-only" ;;
+    *)               warn "GPU $AMDGPU_TARGETS: should work, not measured (Avalon is tuned on a gfx1100)" ;;
 esac
 
 vram_mib=0
@@ -75,9 +77,10 @@ fi
 ram_gib=$(( $(awk '/^MemTotal:/ {print $2}' /proc/meminfo) / 1048576 ))
 echo "RAM $ram_gib GiB"
 # The model (~89 GiB) is memory-mapped: what does not fit in RAM is read again from the disk. Measured on the reference
-# machine with the server's RAM capped at 28 GB (a 32 GB machine): generation -2 to -6 %, prefill of a new 19k prompt
-# -31 % (889 against 1,283 t/s). Not measured below that.
-[ $ram_gib -ge 28 ] || fail "$ram_gib GiB of RAM: Avalon is measured with 32 GB or more (the model is memory-mapped, ~89 GiB)"
+# machine with the server's RAM capped at 14 GB (a 16 GB machine): MTP generation 90.3 against 99.0 t/s on a short
+# prompt; with 28 GB (a 32 GB machine) the prefill of a new 19k prompt -31 % (889 against 1,283 t/s). Not measured below.
+[ $ram_gib -ge 14 ] || fail "$ram_gib GiB of RAM: Avalon is measured with 16 GB or more (the model is memory-mapped, ~89 GiB)"
+[ $ram_gib -ge 28 ] || warn "$ram_gib GiB of RAM: generation stays close, new long prompts are slower (read again from the disk)"
 if [ "${SKIP_MODEL:-0}" != 1 ]; then
     mkdir -p "$MODEL_DIR"
     have=$(du -sk "$MODEL_DIR" 2>/dev/null | cut -f1)
