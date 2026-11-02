@@ -28,7 +28,9 @@ fork-strata's Brilliance Flash-Next. Only one local model runs at a time: they s
   serves port 8080, LM Studio's loaded models, ComfyUI and the CoolerControl window. Games and browsers stay open: close
   a running game first. If Avalon is already up, the click reuses it. Closing the window (or Ctrl+C) unloads it, even
   mid-load; the PC cannot sleep while it is loaded.
-- The model is the stock Qwen3.8-Flash-Next (not abliterated like Brilliance), 256K context, no picture reader.
+- The model is the stock Qwen3.8-Flash-Next (not abliterated like Brilliance), 256K context, with the picture reader:
+  `mmproj-Qwen3.8-Flash-Next-BF16.gguf` in the model folder (copied from Strata-data; ~0.9 GB), loaded with
+  `--image-min-tokens 1024`. Generation stays at 92 - 105 t/s with it loaded (2026-11-02).
 - The first start reads the model from disk; later starts come from the page cache while RAM allows.
 - The launcher pins the experts (`GGML_CUDA_MOE_PIN=1`, Avalon's default) when 70 GiB of RAM or more is free once the
   other model servers are closed, else it leaves them unpinned and says so. Set `GGML_CUDA_MOE_PIN` to force either.
@@ -57,5 +59,5 @@ the page cache before the server starts.
 
 - Tuning for this PC: the server runs the author's settings (6 threads on the P-cores, 2 MTP draft tokens). A sweep of
   threads (6 / 8 / 12) x draft tokens (2 / 3) on the benchmarks above may gain a few percent.
-- Updating from upstream: `git remote add upstream https://github.com/freriadoc/Avalon`, merge `upstream/main` (a real
-  merge, not a squash), then `local/build.sh`. Upstream never touches `local/`.
+- Updating from upstream: merge `upstream/main` (a real merge, not a squash), then `local/build.sh`. Upstream never
+  touches `local/`. Last merged 2026-11-02.

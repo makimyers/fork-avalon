@@ -54,6 +54,8 @@ ARGS=(-m Qwen3.8-Flash-Next-Avalon-IQ3KS-00001-of-00033.gguf --alias "$ALIAS"
   -c "$CTX" -b 9536 -ub 9536 -fa on -ctk q8_0 -ctv q4_0 --jinja --parallel 1
   -md MTP/mtp-Qwen3.8-Flash-Next-shared-IQ3K-IQ4NL-FR65k.gguf --spec-type draft-mtp
   --spec-draft-n-max 2 -ubd 256 -ctkd q8_0 -ctvd q8_0
+  --mmproj mmproj-Qwen3.8-Flash-Next-BF16.gguf   # the picture reader (the same file Strata's Brilliance loads)
+  --image-min-tokens 1024           # the server's advice for Qwen-VL; fine layout checks need the detail
   --reasoning-format deepseek       # thinking in reasoning_content, as dsh's thinking=qwen routes expect
   --host 127.0.0.1 --port "$PORT" --metrics --no-webui)
 
